@@ -1,5 +1,4 @@
 import base64
-import logging
 import httpx
 from math import fsum
 import math
