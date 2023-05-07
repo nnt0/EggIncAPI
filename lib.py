@@ -1,8 +1,8 @@
 import base64
-import httpx
+from typing import List, Optional
 from math import fsum
 import math
-from typing import List
+import httpx
 
 import ei
 
@@ -30,11 +30,14 @@ class EggIncApi:
         return response
 
     async def query_coop(self, contract_id: str, coop_code: str) -> ei.QueryCoopResponse:
-        """Makes the request with league set to 1 (aka standard). Meaning different_league == True means the coop is elite"""
         query_coop_req = ei.QueryCoopRequest(
+            rinfo=ei.BasicRequestInfo(
+                ei_user_id=self.user_id
+            ),
             contract_identifier=contract_id,
             coop_identifier=coop_code,
-            league=1,
+            league=0,
+            grade=ei.ContractPlayerGrade.GRADE_A,
             client_version=self.current_client_version
         )
 
@@ -44,17 +47,17 @@ class EggIncApi:
 
         return query_coop_resp
 
-    async def get_coop_league(self, contract_id: str, coop_code: str) -> int:
-        "returns: 0 means elite, 1 means standard"
-        query_coop_resp = await self.query_coop(contract_id, coop_code)
+    async def get_coop_grade(self, contract_id: str, coop_code: str) -> ei.ContractPlayerGrade:
+        coop_status: ei.ContractCoopStatusResponse = await self.get_coop_status(contract_id, coop_code)
+        bot_first_contact: ei.EggIncFirstContactResponse = await self.bot_first_contact(coop_status.creator_id)
 
-        if query_coop_resp.different_league:
-            return 0
-
-        return 1
+        return bot_first_contact.backup.contracts.contracts[0].grade
 
     async def get_periodicals(self) -> ei.PeriodicalsResponse:
-        periodicals_req = ei.GetPeriodicalsRequest(user_id=self.user_id, current_client_version=self.current_client_version)
+        periodicals_req = ei.GetPeriodicalsRequest(
+            user_id=self.user_id,
+            current_client_version=self.current_client_version
+        )
 
         response = await self.post_to("get_periodicals", periodicals_req)
 
@@ -68,18 +71,25 @@ class EggIncApi:
         periodicals = await self.get_periodicals()
 
         if periodicals.contracts.warning_message != "":
-            print(f"Contracts contained a warning message: {periodicals.contracts.warning_message}")
+            print("Contracts contained a warning message: %s", periodicals.contracts.warning_message)
 
         # contracts = list(
         #     filter(
-        #         lambda contract: contract.identifier != "first-contract" and contract.max_coop_size != 0, 
+        #         lambda contract: contract.identifier != "first-contract" and contract.max_coop_size != 0, periodicals.contracts.contracts
         #     )
         # )
 
         return periodicals.contracts.contracts
 
     async def get_coop_status(self, contract_id: str, coop_code: str) -> ei.ContractCoopStatusResponse:
-        coop_status_request = ei.ContractCoopStatusRequest(contract_identifier=contract_id, coop_identifier=coop_code, user_id=self.user_id)
+        coop_status_request = ei.ContractCoopStatusRequest(
+            rinfo=ei.BasicRequestInfo(
+                ei_user_id=self.user_id
+            ),
+            contract_identifier=contract_id,
+            coop_identifier=coop_code,
+            user_id=self.user_id
+        )
 
         response = await self.post_to("coop_status", coop_status_request)
 
@@ -89,28 +99,41 @@ class EggIncApi:
 
         return coop_status_response
 
-    async def bot_first_contact(self) -> ei.EggIncFirstContactResponse:
-        first_contact_req = ei.EggIncFirstContactRequest(user_id=self.user_id)
+    async def bot_first_contact(self, user_id: Optional[str] = None) -> ei.EggIncFirstContactResponse:
+        if user_id is None:
+            user_id = self.user_id
+
+        first_contact_req = ei.EggIncFirstContactRequest(
+            rinfo=ei.BasicRequestInfo(ei_user_id=user_id),
+            ei_user_id=user_id
+        )
 
         response = await self.post_to("bot_first_contact", first_contact_req)
 
-        first_contact_resp = ei.EggIncFirstContactResponse().parse(response.content)
+        first_contact_resp = ei.EggIncFirstContactResponse().parse(base64.b64decode(response.text))
 
         return first_contact_resp
 
 class CoOp:
     contract: ei.Contract
     coop_code: str
-    league: int
-    """0 means elite, 1 means standard"""
+    grade: ei.ContractPlayerGrade
+    goals: List[ei.ContractGoal]
 
-    def __init__(self, contract: ei.Contract, coop_code: str, league: int) -> None:
+    def __init__(self, contract: ei.Contract, coop_code: str, grade: ei.ContractPlayerGrade) -> None:
         self.contract = contract
         self.coop_code = coop_code
-        self.league = league
+        self.grade = grade
+
+        for grade_spec in self.contract.grade_specs:
+            if grade_spec.grade is self.grade:
+                self.goals = grade_spec.goals
+                break
 
     async def get_status(self, eggincapi: EggIncApi) -> ei.ContractCoopStatusResponse:
-        return await eggincapi.get_coop_status(self.contract.identifier, self.coop_code)
+        coop_stats = await eggincapi.get_coop_status(self.contract.identifier, self.coop_code)
+
+        return coop_stats
 
     def get_eggs_shipping_per_second(self, coop_stats: ei.ContractCoopStatusResponse) -> int:
         total_eggs_shipping_per_second = fsum(
@@ -137,9 +160,8 @@ class CoOp:
         return (self.get_highest_goal().target_amount - coop_stats.total_amount) / total_eggs_shipping_per_second
 
     def get_highest_goal(self) -> ei.ContractGoal:
-        goals = self.contract.goal_sets[self.league].goals
-        highest_goal = goals[0]
-        for goal in goals:
+        highest_goal = self.goals[0]
+        for goal in self.goals:
             if goal.target_amount > highest_goal.target_amount:
                 highest_goal = goal
 
